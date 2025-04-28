@@ -300,3 +300,16 @@ def read_benchmark_log(filename):
         decode_latency, decode_throughput,
         total_latency, total_throughput,
     )
+
+
+def remove_outliers(costs, threshold=2):
+    """Remove outliers from costs."""
+    costs = np.array(costs)
+    mean = np.mean(costs)
+    std = np.std(costs)
+    lower_bound = mean - threshold * std
+    upper_bound = mean + threshold * std
+    
+    costs[costs < lower_bound] = mean
+    costs[costs > upper_bound] = mean
+    return costs

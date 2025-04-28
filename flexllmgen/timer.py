@@ -3,6 +3,8 @@ from collections import namedtuple
 import time
 from typing import Callable, Any
 
+from flexllmgen.utils import remove_outliers
+
 
 class _Timer:
     """An internal timer."""
@@ -71,6 +73,27 @@ class Timers:
 
     def __contains__(self, name: str):
         return name in self.timers
+    
+    def plot(self, n: int, save_path: str = "./timers.png"):
+        """Plot the timers."""
+        import matplotlib.pyplot as plt
+
+        for name, timer in self.timers.items():
+            if name != "generate" and name != "load_weight" and "prefill" not in name and "batch" not in name:
+                costs = remove_outliers(timer.costs, threshold=2)
+                avg_cost = sum(costs) / len(costs)
+                plt.plot(timer.costs, label=f"{name}: {avg_cost:.7f} s")
+            elif name == "load_weight":
+                costs = remove_outliers(timer.costs[-(len(self.timers["compute_layer_decoding"].costs)):], threshold=1)
+                avg_cost = sum(costs) / len(costs)
+                plt.plot(timer.costs[-(len(self.timers["compute_layer_decoding"].costs)):], label=f"{name}: {avg_cost:.7f} s")
+                
+        plt.xlabel("Iteration")
+        plt.ylabel("Cost")
+        plt.ylim(0, 0.006)
+        plt.legend()
+        plt.savefig(save_path)
+        plt.close()
 
 
 timers = Timers()

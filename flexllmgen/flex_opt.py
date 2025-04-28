@@ -927,7 +927,7 @@ class OptLM:
             timers("generate").stop()
 
     def generation_loop_debug_normal(self):
-        execute_num_batches = 20
+        execute_num_batches = 66 * 1
         batch_ct = 0
         pbar = tqdm(total=execute_num_batches)
         timers("prefill_total").reset()
@@ -959,12 +959,16 @@ class OptLM:
             for j in range(self.num_layers):
                 if i > 0: timers("decoding_gpu_batch").start()
 
-                load_weight_timer.start(self.sync)
-                for k in range(self.num_gpu_batches):
-                    self.load_weight(i, j, k)
-                load_weight_timer.stop(self.sync)
+                if j == 0:
+                    for k in range(self.num_gpu_batches):
+                        self.load_weight(i, j, k)
 
                 for k in range(self.num_gpu_batches):
+                    if j < self.num_layers - 1:
+                        load_weight_timer.start(self.sync)
+                        self.load_weight(i, j + 1, k)
+                        load_weight_timer.stop(self.sync)
+
                     load_cache_timer.start(self.sync)
                     self.load_cache(i, j, k)
                     load_cache_timer.stop(self.sync)
@@ -1007,6 +1011,8 @@ class OptLM:
                 name = func + "_" + stage
                 costs = timers(name).costs
                 print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
+
+        timers.plot(self.num_layers * self.num_gpu_batches, "./plots/opt-6_7b.png")
 
     def generation_loop_overlap_single_batch(self):
         # Prologue
