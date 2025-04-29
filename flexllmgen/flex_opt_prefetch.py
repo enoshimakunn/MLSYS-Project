@@ -657,10 +657,9 @@ class OptLM:
             i += 1
             if i == self.execute_gen_len:
                 return
-
         
         # Check if weight for layer j has already been prefetched
-        if hasattr(self, 'weight_prefetched') and self.weight_prefetched[j]:
+        if self.weight_prefetched[j]:
             # Already prefetched, skip loading
             self.weight_prefetched[j] = False  # Clear flag for next round
             return
@@ -981,14 +980,14 @@ class OptLM:
 
                 if j == 0:
                     for k in range(self.num_gpu_batches):
+                        load_weight_timer.start(self.sync)
                         self.load_weight(i, j, k)
+                        load_weight_timer.stop(self.sync)
 
                 for k in range(self.num_gpu_batches):
                     if j < self.num_layers - 1:
                         load_weight_timer.start(self.sync)
                         self.load_weight(i, j + 1, k)
-                        # if j % 2 == 0 and j + 2 < self.num_layers:
-                        #     self.prefetch_weight(i, j + 2, k)
                         load_weight_timer.stop(self.sync)
 
                     load_cache_timer.start(self.sync)
@@ -1000,7 +999,9 @@ class OptLM:
                     compute_layer_timer.stop(self.sync)
                     self.store_hidden(i, j, k)
                     store_cache_timer.start(self.sync)
-                    self.store_cache(i, j, k)
+                    self.store_cache(i, j-1, k)
+                    if j % 2 == 1 and j + 2 < self.num_layers:
+                        self.prefetch_weight(i, j + 2, k)
                     store_cache_timer.stop(self.sync)
 
                 if i > 0:
@@ -1053,7 +1054,7 @@ class OptLM:
                 self.compute_layer(i, j, 0)
                 self.store_cache(i, j-1, 0)
                 self.store_hidden(i, j, 0)
-                if j % 2 == 0:
+                if j % 2 == 1:
                     self.prefetch_weight(i, j+2, 0)
                 self.sync()
             timers("generate").stop()
@@ -1081,7 +1082,7 @@ class OptLM:
                     self.load_hidden(i, j, k+1)
                     self.compute_layer(i, j, k)
                     self.store_cache(i, j, k-1)
-                    if j % 2 == 0:
+                    if j % 2 == 1:
                         self.prefetch_weight(i, j+2, k)
                     self.sync()
             timers("generate").stop()
