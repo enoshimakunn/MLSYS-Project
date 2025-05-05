@@ -657,6 +657,12 @@ class OptLM:
             i += 1
             if i == self.execute_gen_len:
                 return
+        
+        # Check if weight for layer j has already been prefetched
+        if self.weight_prefetched[j]:
+            # Already prefetched, skip loading
+            self.weight_prefetched[j] = False  # Clear flag for next round
+            return
 
         # Load from weight_home to weight_read_buf
         if overlap:
@@ -698,6 +704,7 @@ class OptLM:
             self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
 
     def store_cache(self, i, j, k, overlap=True):
+        next_j = j + 3
         # Handle corner cases
         if k == -1:
             k = self.num_gpu_batches - 1
@@ -716,6 +723,10 @@ class OptLM:
         if overlap:
             with torch.cuda.stream(self.store_cache_stream):
                 self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
+                # # prefetch weight for next layer
+                # if next_j < self.num_layers and not self.weight_prefetched[next_j]:
+                #     self.load_weight(i, next_j, k, overlap=True)
+                #     self.weight_prefetched[next_j] = True
         else:
             self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
 
@@ -789,6 +800,12 @@ class OptLM:
         self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
             self.weight_read_buf[j], self.attention_mask[k],
             self.cache_write_buf[j][k], i, k)
+
+    def prefetch_weight(self, i, j, k):
+        if j < self.num_layers and not self.weight_prefetched[j]:          
+            with torch.cuda.stream(self.store_cache_stream):
+                self.load_weight(i,j,k, overlap=True)
+            self.weight_prefetched[j] = True
 
     def sync(self):
         self.env.disk.synchronize()
@@ -868,6 +885,8 @@ class OptLM:
         for k in range(num_gpu_batches):
             self.attention_mask[k].clear()
         self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
+        
+        self.weight_prefetched = [False] * self.num_layers
 
         # Init cache
         self.set_task(task)
@@ -961,7 +980,9 @@ class OptLM:
 
                 if j == 0:
                     for k in range(self.num_gpu_batches):
+                        load_weight_timer.start(self.sync)
                         self.load_weight(i, j, k)
+                        load_weight_timer.stop(self.sync)
 
                 for k in range(self.num_gpu_batches):
                     if j < self.num_layers - 1:
@@ -978,7 +999,9 @@ class OptLM:
                     compute_layer_timer.stop(self.sync)
                     self.store_hidden(i, j, k)
                     store_cache_timer.start(self.sync)
-                    self.store_cache(i, j, k)
+                    self.store_cache(i, j-1, k)
+                    if j % 2 == 1 and j + 2 < self.num_layers:
+                        self.prefetch_weight(i, j + 2, k)
                     store_cache_timer.stop(self.sync)
 
                 if i > 0:
@@ -1031,6 +1054,8 @@ class OptLM:
                 self.compute_layer(i, j, 0)
                 self.store_cache(i, j-1, 0)
                 self.store_hidden(i, j, 0)
+                if j % 2 == 1:
+                    self.prefetch_weight(i, j+2, 0)
                 self.sync()
             timers("generate").stop()
 
@@ -1057,6 +1082,8 @@ class OptLM:
                     self.load_hidden(i, j, k+1)
                     self.compute_layer(i, j, k)
                     self.store_cache(i, j, k-1)
+                    if j % 2 == 1:
+                        self.prefetch_weight(i, j+2, k)
                     self.sync()
             timers("generate").stop()
 

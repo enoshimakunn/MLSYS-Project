@@ -77,20 +77,31 @@ class Timers:
     def plot(self, n: int, save_path: str = "./timers.png"):
         """Plot the timers."""
         import matplotlib.pyplot as plt
-
+        
+        max_times_per_iter = None
         for name, timer in self.timers.items():
             if name != "generate" and name != "load_weight" and "prefill" not in name and "batch" not in name:
                 costs = remove_outliers(timer.costs, threshold=2)
                 avg_cost = sum(costs) / len(costs)
+                if not max_times_per_iter:
+                    max_times_per_iter = timer.costs
+                else:
+                    max_times_per_iter = [max(a, b) for a, b in zip(max_times_per_iter, timer.costs)]
                 plt.plot(timer.costs, label=f"{name}: {avg_cost:.7f} s")
             elif name == "load_weight":
-                costs = remove_outliers(timer.costs[-(len(self.timers["compute_layer_decoding"].costs)):], threshold=1)
+                costs = remove_outliers(timer.costs[-(len(self.timers["compute_layer_decoding"].costs)) + 1:], threshold=1)
                 avg_cost = sum(costs) / len(costs)
-                plt.plot(timer.costs[-(len(self.timers["compute_layer_decoding"].costs)):], label=f"{name}: {avg_cost:.7f} s")
-                
+                if not max_times_per_iter:
+                    max_times_per_iter = timer.costs[-(len(self.timers["compute_layer_decoding"].costs)) + 1:]
+                else:
+                    max_times_per_iter = [max(a, b) for a, b in zip(max_times_per_iter, timer.costs[-(len(self.timers["compute_layer_decoding"].costs)):])]
+                plt.plot(timer.costs[-(len(self.timers["compute_layer_decoding"].costs)) + 1:], label=f"{name}: {avg_cost:.7f} s")
+
+        
+        plt.plot(max_times_per_iter, label="Max time per iter")
         plt.xlabel("Iteration")
         plt.ylabel("Cost")
-        plt.ylim(0, 0.006)
+        plt.ylim(0, 0.01)
         plt.legend()
         plt.savefig(save_path)
         plt.close()
