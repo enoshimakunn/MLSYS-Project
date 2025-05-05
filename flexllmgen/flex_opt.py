@@ -335,13 +335,79 @@ class SelfAttention:
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
         cache_home.store(cache)
 
-    def load_cache(self, cache_home, cache_read_buf, i):
-        if i == 0:  # prefill, no cache
+    # def load_cache(self, cache_home, cache_read_buf, i):
+    #     if i == 0:  # prefill, no cache
+    #         return
+
+    #     k_home, v_home = cache_home.val
+
+    #     # Pick code path
+    #     if self.policy.compress_cache:
+    #         path = 0
+    #         dst = self.attention_compute.compressed_device
+    #     else:
+    #         if self.policy.cpu_cache_compute:
+    #             if (k_home.device.device_type == DeviceType.MIXED and
+    #                 k_home.data[0][0] is not None):
+    #                 path = 2
+    #             else:
+    #                 path = 1
+    #         else:
+    #             path = 0
+    #         dst = self.attention_compute
+
+    #     if path == 0:  # Direct copy
+    #         # shape: (s, b * n_head, head_dim)
+    #         indices = (slice(0, self.task.prompt_len + i),
+    #                    slice(0, k_home.shape[1]))
+
+    #         if self.policy.attn_sparsity >= 1.0:
+    #             cache_read_buf.store((
+    #                 k_home.smart_copy(dst, indices),
+    #                 v_home.smart_copy(dst, indices),
+    #             ))
+    #         else:
+    #             cache_read_buf.store((
+    #                 k_home.smart_copy(dst, indices),
+    #                 (v_home, False),
+    #             ))
+    #     elif path == 1:  # Copy to CPU temporary workspace
+    #         # shape: (s, b * n_head, head_dim)
+    #         k_buf, v_buf = dst.next_attention_compute_workspace()
+    #         indices = (slice(0, self.task.prompt_len + i - 1),
+    #                    slice(0, k_home.shape[1]))
+    #         general_copy(k_buf, indices, k_home, indices)
+
+    #         if self.policy.attn_sparsity >= 1.0:
+    #             general_copy(v_buf, indices, v_home, indices)
+    #             cache_read_buf.store(((k_buf, False), (v_buf, False)))
+    #         else:
+    #             cache_read_buf.store(((k_buf, False), ((v_home, v_buf), False)))
+    #     elif path == 2:  # Copy to both GPU and CPU
+    #         # The caches are stored on both GPU and other devices.
+    #         # Compute attention on gpu for caches stored on gpu.
+    #         # Compute attention on cpu for caches stored on cpu/disk.
+    #         gpu_k_buf = k_home.data[0][0]
+    #         gpu_v_buf = v_home.data[0][0]
+
+    #         # shape: (s, b * n_head, head_dim)
+    #         k_buf, v_buf = dst.next_attention_compute_workspace()
+    #         indices = (slice(0, self.task.prompt_len + i - 1),
+    #                    slice(gpu_k_buf.shape[1], k_home.shape[1]))
+    #         general_copy(k_buf, indices, k_home, indices)
+    #         general_copy(v_buf, indices, v_home, indices)
+    #         cache_read_buf.store((((gpu_k_buf, k_buf,), False),
+    #                               ((gpu_v_buf, v_buf,), False)))
+    #         assert self.policy.attn_sparsity >= 1.0
+    #     else:
+    #         raise ValueError(f"Invalid path: {path}")
+        
+    def load_k_cache(self, cache_home, k_buf, i):
+        if i == 0: 
             return
 
-        k_home, v_home = cache_home.val
+        k_home, _ = cache_home.val
 
-        # Pick code path
         if self.policy.compress_cache:
             path = 0
             dst = self.attention_compute.compressed_device
@@ -356,48 +422,74 @@ class SelfAttention:
                 path = 0
             dst = self.attention_compute
 
-        if path == 0:  # Direct copy
-            # shape: (s, b * n_head, head_dim)
+        if path == 0:
             indices = (slice(0, self.task.prompt_len + i),
                        slice(0, k_home.shape[1]))
+            k_buf.store(k_home.smart_copy(dst, indices))
 
-            if self.policy.attn_sparsity >= 1.0:
-                cache_read_buf.store((
-                    k_home.smart_copy(dst, indices),
-                    v_home.smart_copy(dst, indices),
-                ))
-            else:
-                cache_read_buf.store((
-                    k_home.smart_copy(dst, indices),
-                    (v_home, False),
-                ))
-        elif path == 1:  # Copy to CPU temporary workspace
-            # shape: (s, b * n_head, head_dim)
-            k_buf, v_buf = dst.next_attention_compute_workspace()
+        elif path == 1:
+            k_tmp, _ = dst.next_attention_compute_workspace()
             indices = (slice(0, self.task.prompt_len + i - 1),
                        slice(0, k_home.shape[1]))
-            general_copy(k_buf, indices, k_home, indices)
+            general_copy(k_tmp, indices, k_home, indices)
+            k_buf.store((k_tmp, False))
 
-            if self.policy.attn_sparsity >= 1.0:
-                general_copy(v_buf, indices, v_home, indices)
-                cache_read_buf.store(((k_buf, False), (v_buf, False)))
-            else:
-                cache_read_buf.store(((k_buf, False), ((v_home, v_buf), False)))
-        elif path == 2:  # Copy to both GPU and CPU
-            # The caches are stored on both GPU and other devices.
-            # Compute attention on gpu for caches stored on gpu.
-            # Compute attention on cpu for caches stored on cpu/disk.
+        elif path == 2:
             gpu_k_buf = k_home.data[0][0]
-            gpu_v_buf = v_home.data[0][0]
-
-            # shape: (s, b * n_head, head_dim)
-            k_buf, v_buf = dst.next_attention_compute_workspace()
+            k_tmp, _ = dst.next_attention_compute_workspace()
             indices = (slice(0, self.task.prompt_len + i - 1),
                        slice(gpu_k_buf.shape[1], k_home.shape[1]))
-            general_copy(k_buf, indices, k_home, indices)
-            general_copy(v_buf, indices, v_home, indices)
-            cache_read_buf.store((((gpu_k_buf, k_buf,), False),
-                                  ((gpu_v_buf, v_buf,), False)))
+            general_copy(k_tmp, indices, k_home, indices)
+            k_buf.store(((gpu_k_buf, k_tmp), False))
+        else:
+            raise ValueError(f"Invalid path: {path}")
+
+
+    def load_v_cache(self, cache_home, v_buf, i):
+        if i == 0:
+            return
+
+        _, v_home = cache_home.val
+
+        if self.policy.compress_cache:
+            path = 0
+            dst = self.attention_compute.compressed_device
+        else:
+            if self.policy.cpu_cache_compute:
+                if (v_home.device.device_type == DeviceType.MIXED and
+                    v_home.data[0][0] is not None):
+                    path = 2
+                else:
+                    path = 1
+            else:
+                path = 0
+            dst = self.attention_compute
+
+        if path == 0:
+            indices = (slice(0, self.task.prompt_len + i),
+                       slice(0, v_home.shape[1]))
+            if self.policy.attn_sparsity >= 1.0:
+                v_buf.store(v_home.smart_copy(dst, indices))
+            else:
+                v_buf.store((v_home, False))
+
+        elif path == 1:
+            _, v_tmp = dst.next_attention_compute_workspace()
+            indices = (slice(0, self.task.prompt_len + i - 1),
+                       slice(0, v_home.shape[1]))
+            if self.policy.attn_sparsity >= 1.0:
+                general_copy(v_tmp, indices, v_home, indices)
+                v_buf.store((v_tmp, False))
+            else:
+                v_buf.store(((v_home, v_tmp), False))
+
+        elif path == 2:
+            gpu_v_buf = v_home.data[0][0]
+            _, v_tmp = dst.next_attention_compute_workspace()
+            indices = (slice(0, self.task.prompt_len + i - 1),
+                       slice(gpu_v_buf.shape[1], v_home.shape[1]))
+            general_copy(v_tmp, indices, v_home, indices)
+            v_buf.store(((gpu_v_buf, v_tmp), False))
             assert self.policy.attn_sparsity >= 1.0
         else:
             raise ValueError(f"Invalid path: {path}")
@@ -561,8 +653,18 @@ class TransformerLayer:
     def init_cache_one_gpu_batch(self, cache_home):
         self.attention.init_cache_one_gpu_batch(cache_home)
 
+    # def load_cache(self, cache_home, cache_read_buf, i):
+    #     self.attention.load_cache(cache_home, cache_read_buf, i)
+
+    def load_k_cache(self, cache_home, cache_read_buf, i):
+        self.attention.load_k_cache(cache_home, cache_read_buf, i)
+
+    def load_v_cache(self, cache_home, cache_read_buf, i):
+        self.attention.load_v_cache(cache_home, cache_read_buf, i)
+
     def load_cache(self, cache_home, cache_read_buf, i):
-        self.attention.load_cache(cache_home, cache_read_buf, i)
+        self.load_k_cache(cache_home, cache_read_buf, i)
+        self.load_v_cache(cache_home, cache_read_buf, i)
 
     def store_cache(self, cache_home, cache_write_buf, i):
         self.attention.store_cache(cache_home, cache_write_buf, i)
@@ -677,25 +779,45 @@ class OptLM:
     def init_cache(self, j, k):
         self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k])
 
-    def load_cache(self, i, j, k, overlap=True):
-        # Handle corner cases
-        if i == 0:  # prefill, no cache
-            return
-        if k == self.num_gpu_batches:
-            k = 0
-            j += 1
-        if j == self.num_layers:
-            j = 0
-            i += 1
-            if i == self.execute_gen_len:
-                return
+    # def load_cache(self, i, j, k, overlap=True):
+    #     # Handle corner cases
+    #     if i == 0:  # prefill, no cache
+    #         return
+    #     if k == self.num_gpu_batches:
+    #         k = 0
+    #         j += 1
+    #     if j == self.num_layers:
+    #         j = 0
+    #         i += 1
+    #         if i == self.execute_gen_len:
+    #             return
 
-        # Load from cache_home to cache_read_buf
+    #     # Load from cache_home to cache_read_buf
+    #     if overlap:
+    #         with torch.cuda.stream(self.load_cache_stream):
+    #             self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+    #     else:
+    #         self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+
+    def load_k_cache(self, i, j, k, overlap=True):
+        if i == 0: return
         if overlap:
             with torch.cuda.stream(self.load_cache_stream):
-                self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+                self.layers[j].load_k_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
         else:
-            self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+            self.layers[j].load_k_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+
+    def load_v_cache(self, i, j, k, overlap=True):
+        if i == 0: return
+        if overlap:
+            with torch.cuda.stream(self.load_cache_stream):
+                self.layers[j].load_v_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+        else:
+            self.layers[j].load_v_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+
+    def load_cache(self, i, j, k, overlap=True):
+        self.load_k_cache(i, j, k, overlap)
+        self.load_v_cache(i, j, k, overlap)
 
     def store_cache(self, i, j, k, overlap=True):
         # Handle corner cases
