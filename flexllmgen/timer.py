@@ -101,7 +101,7 @@ class Timers:
         plt.plot(max_times_per_iter, label="Max time per iter")
         plt.xlabel("Iteration")
         plt.ylabel("Cost")
-        plt.ylim(0, 0.01)
+        plt.ylim(0, 0.015)
         plt.legend()
         plt.savefig(save_path)
         plt.close()

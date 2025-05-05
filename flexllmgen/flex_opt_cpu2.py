@@ -317,18 +317,6 @@ class SelfAttention:
                 w_v.smart_copy(dst1), b_v.smart_copy(dst2),
                 w_out.smart_copy(dst1), b_out.smart_copy(dst2),
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
-            
-    def load_weight_attn(self, weight_home, weight_read_buf, k):
-        w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln = weight_home.val
-        if k == 0:
-            dst1 = self.weight_load_dst
-            dst2 = self.attention_compute
-            weight_read_buf.store((
-                w_q.smart_copy(dst1), b_q.smart_copy(dst2),
-                w_k.smart_copy(dst1), b_k.smart_copy(dst2),
-                w_v.smart_copy(dst1), b_v.smart_copy(dst2),
-                w_out.smart_copy(dst1), b_out.smart_copy(dst2),
-                w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
     def init_cache_one_gpu_batch(self, cache_home):
         if self.policy.cache_gpu_percent == 100:
@@ -346,18 +334,6 @@ class SelfAttention:
 
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
         cache_home.store(cache)
-
-    def init_qkv(self, qkv_home):
-        device = self.env.cpu
-
-        q, k_new, v_new = device.init_qkv(self.config, self.task, self.policy)
-        qkv_home.store((q, k_new, v_new))
-    
-    def init_value(self, value_home):
-        device = self.env.gpu
-
-        value = device.init_value_one_gpu_batch(self.config, self.task, self.policy)
-        value_home.store(value)
 
     def load_cache(self, cache_home, cache_read_buf, i):
         if i == 0:  # prefill, no cache
@@ -446,14 +422,9 @@ class SelfAttention:
         general_copy(v_home, indices, v_new, None)
 
     def load_qkv(self, qkv_home, qkv_read_buf, i):
-        q_home, k_home, v_home = qkv_home.val
-        qkv_read_buf.store((q_home, k_home, v_home))
+        raise NotImplementedError
     
     def store_qkv(self, qkv_home, qkv_write_buf, i):
-        """
-        After gpu calculates q = x@w_q, k = x@w_k, v = x@w_v,
-        transfer q, k, v to cpu
-        """
         q_home, k_home, v_home = qkv_home.val
         q_new, k_new, v_new = qkv_write_buf.pop()
 
@@ -465,14 +436,9 @@ class SelfAttention:
         general_copy(v_home, None, v_new, None)
     
     def load_value(self, value_home, value_read_buf, i):
-        v_home = value_home.val
-        value_read_buf.store(v_home)
+        raise NotImplementedError
     
     def store_value(self, value_home, value_write_buf, i):
-        """
-        After cpu calculates the attention results (h = softmax(q @ k^T) @ v),
-        transfer the results back to gpu
-        """
         h_home = value_home.val
         h_new = value_write_buf.pop()
 
@@ -532,7 +498,6 @@ class SelfAttention:
         if i == 0:  # prefill
             raise NotImplementedError("Prefill with cpu attn computing is not implemented")
         else:  # decoding
-            # Compute q, k, v transformation on gpu
             q, new_k, new_v = self.compute.mha_gen_preattn(h, None, w_q,
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
                 None, None, donate, self.policy.attn_sparsity,
@@ -557,10 +522,7 @@ class SelfAttention:
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
             (q, k_new, v_new) = qkv_read_buf.pop()
-
-            # Compute attention matrix on cpu
-            # attention_compute will be set to cpu if cpu_cache_compute is turned on
-            value, new_k_cache, new_v_cache = self.attention_compute.mha_gen_attn(h, mask, w_q,
+            value, new_k_cache, new_v_cache = self.compute.mha_gen_attn(h, mask, w_q,
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
                 k_cache, v_cache, donate, self.policy.attn_sparsity,
                 self.policy.compress_cache, self.policy.comp_cache_config, q, k_new, v_new)
@@ -588,8 +550,6 @@ class SelfAttention:
             raise NotImplementedError("Prefill with cpu attn computing is not implemented")
         else:  # decoding
             value = value_read_buf.pop()
-
-            # Compute output transformation on gpu
             h = self.compute.mha_gen_postattn(h, None, w_q,
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
                 None, None, donate, self.policy.attn_sparsity,
@@ -757,10 +717,7 @@ class OptLM:
         self.load_weight_stream = torch.cuda.Stream()
         self.load_cache_stream = torch.cuda.Stream()
         self.store_cache_stream = torch.cuda.Stream()
-        self.load_qkv_stream = torch.cuda.Stream()
-        self.store_qkv_stream = torch.cuda.Stream()
-        self.load_value_stream = torch.cuda.Stream()
-        self.store_value_stream = torch.cuda.Stream()
+        self.compute_layer_stream = torch.cuda.Stream()
 
         # Intermediate tensors
         # The following buffers store values used
@@ -775,16 +732,6 @@ class OptLM:
         self.weight_read_buf = array_1d(num_layers, ValueHolder)
         # attention_mask[k]
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
-
-        # qkv
-        self.qkv_home = array_2d(num_layers, num_gpu_batches, ValueHolder)
-        self.qkv_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
-        self.qkv_write_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
-
-        # value
-        self.value_home = array_2d(num_layers, num_gpu_batches, ValueHolder)
-        self.value_read_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
-        self.value_write_buf = array_2d(num_layers, num_gpu_batches, ValueHolder)
 
         self.task = None
         self.init_all_weights()
@@ -815,25 +762,13 @@ class OptLM:
         if overlap:
             with torch.cuda.stream(self.load_weight_stream):
                 self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
+
+            # Record end of stream
+            self.load_weight_event[i][j][k].record(self.load_weight_stream)
+            # self.load_weight_event[i][j][k].synchronize()
+
         else:
             self.layers[j].load_weight(self.weight_home[j], self.weight_read_buf[j], k)
-
-    def load_weight_attn(self, i, j, k, overlap=True):
-        # Handle corner cases
-        if j == self.num_layers:
-            j = 0
-            i += 1
-            if i == self.execute_gen_len:
-                return
-        
-        assert isinstance(self.layers[j], SelfAttention)
-
-        # Load from weight_home to weight_read_buf
-        if overlap:
-            with torch.cuda.stream(self.load_weight_stream):
-                self.layers[j].load_weight_attn(self.weight_home[j], self.weight_read_buf[j], k)
-        else:
-            self.layers[j].load_weight_attn(self.weight_home[j], self.weight_read_buf[j], k)
 
     def delete_weight(self, j, k):
         if k == 0:
@@ -846,16 +781,6 @@ class OptLM:
 
     def init_cache(self, j, k):
         self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k])
-
-    def init_qkv(self, j, k):
-        if self.layers[j] is not SelfAttention:
-            return
-        self.layers[j].init_qkv(self.qkv_home[j][k])
-    
-    def init_value(self, j, k):
-        if self.layers[j] is not SelfAttention:
-            return
-        self.layers[j].init_value(self.value_home[j][k])
 
     def load_cache(self, i, j, k, overlap=True):
         # Handle corner cases
@@ -874,8 +799,13 @@ class OptLM:
         if overlap:
             with torch.cuda.stream(self.load_cache_stream):
                 self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+
+            # Record end of stream
+            self.load_cache_event[i][j][k].record(self.load_cache_stream)
+            # self.load_cache_event[i][j][k].synchronize()
+
         else:
-            self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+            self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)        
 
     def store_cache(self, i, j, k, overlap=True):
         # Handle corner cases
@@ -895,6 +825,7 @@ class OptLM:
         # Delete cache_write_buf
         if overlap:
             with torch.cuda.stream(self.store_cache_stream):
+                self.store_cache_stream.wait_event(self.compute_layer_event[i][j][k])
                 self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
         else:
             self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
@@ -961,117 +892,29 @@ class OptLM:
             if x.val:  # x may already be moved due to overlapping
                 x.val = x.val.move(self.act_home)
 
-    def load_qkv(self, i, j, k, overlap=True):
-        # Handle corner cases
-        if i == 0:  # prefill, no cache
-            raise NotImplementedError("Prefill with cpu attn computing is not implemented")
-        if k == self.num_gpu_batches:
-            k = 0
-            j += 1
-        if j == self.num_layers:
-            j = 0
-            i += 1
-            if i == self.execute_gen_len:
-                return
-
-        # Load from cache_home to cache_read_buf
-        if overlap:
-            with torch.cuda.stream(self.load_qkv_stream):
-                self.layers[j].load_cache(self.qkv_home[j][k], self.qkv_read_buf[j][k], i)
-        else:
-            self.layers[j].load_cache(self.qkv_home[j][k], self.qkv_read_buf[j][k], i)
-    
-    def store_qkv(self, i, j, k, overlap=True):
-        # Handle corner cases
-        # if k == -1:
-        #     k = self.num_gpu_batches - 1
-        #     j -= 1
-        # if j == -1:
-        #     j = self.num_layers - 1
-        #     i -= 1
-        #     if i == -1:
-        #         return
-        # if i == self.task.gen_len - 1:  # last token, no need to store cache
-        #     self.cache_write_buf[j][k].pop()
-        #     return
-
-        # Store cache_write_buf to cache_home
-        # Delete cache_write_buf
-        if overlap:
-            with torch.cuda.stream(self.store_qkv_stream):
-                self.layers[j].store_cache(self.qkv_home[j][k], self.qkv_write_buf[j][k], i)
-        else:
-            self.layers[j].store_cache(self.qkv_home[j][k], self.qkv_write_buf[j][k], i)
-    
-    def load_value(self, i, j, k, overlap=True):
-        # Handle corner cases
-        if i == 0:  # prefill, no cache
-            raise NotImplementedError("Prefill with cpu attn computing is not implemented")
-        if k == self.num_gpu_batches:
-            k = 0
-            j += 1
-        if j == self.num_layers:
-            j = 0
-            i += 1
-            if i == self.execute_gen_len:
-                return
-
-        # Load from cache_home to cache_read_buf
-        if overlap:
-            with torch.cuda.stream(self.load_cache_stream):
-                self.layers[j].load_cache(self.value_home[j][k], self.value_read_buf[j][k], i)
-        else:
-            self.layers[j].load_cache(self.value_home[j][k], self.value_read_buf[j][k], i)
-    
-    def store_value(self, i, j, k, overlap=True):
-        # Handle corner cases
-        # if k == -1:
-        #     k = self.num_gpu_batches - 1
-        #     j -= 1
-        # if j == -1:
-        #     j = self.num_layers - 1
-        #     i -= 1
-        #     if i == -1:
-        #         return
-        # if i == self.task.gen_len - 1:  # last token, no need to store cache
-        #     self.cache_write_buf[j][k].pop()
-        #     return
-
-        # Store cache_write_buf to cache_home
-        # Delete cache_write_buf
-        if overlap:
-            with torch.cuda.stream(self.store_qkv_stream):
-                self.layers[j].store_cache(self.value_home[j][k], self.value_write_buf[j][k], i)
-        else:
-            self.layers[j].store_cache(self.value_home[j][k], self.value_write_buf[j][k], i)
-
     def compute_layer(self, i, j, k):
         # Update the hidden in place
         # Clear the weight_read_buf if it is the last gpu batch
         # Clear the cache_read_buf
         # Run layer computation
-        self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
-            self.weight_read_buf[j], self.attention_mask[k],
-            self.cache_write_buf[j][k], i, k)
-        
-    def compute_layer_preattn(self, i, j, k):
-        assert self.layers[j] is SelfAttention
-        self.layers[j].forward_preattn(self.hidden[i][j][k], self.cache_read_buf[j][k],
-            self.weight_read_buf[j], self.attention_mask[k],
-            self.cache_write_buf[j][k], i, k, self.qkv_write_buf[j][k])
-    
-    def compute_layer_attn(self, i, j, k):
-        assert self.layers[j] is SelfAttention
-        self.layers[j].forward_attn(self.hidden[i][j][k], self.cache_read_buf[j][k],
-            self.weight_read_buf[j], self.attention_mask[k],
-            self.cache_write_buf[j][k], i, k, self.qkv_read_buf[j][k],
-            self.value_write_buf[j][k])
+        if not self.policy.overlap:
+            self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
+                self.weight_read_buf[j], self.attention_mask[k],
+                self.cache_write_buf[j][k], i, k)
+        else:
+            with torch.cuda.stream(self.compute_layer_stream):
+                self.compute_layer_stream.wait_event(self.load_cache_event[i][j][k])
+                self.compute_layer_stream.wait_event(self.load_weight_event[i][j][k])
 
-    def compute_layer_postattn(self, i, j, k):
-        assert self.layers[j] is SelfAttention
-        self.layers[j].forward_postattn(self.hidden[i][j][k], self.cache_read_buf[j][k],
-            self.weight_read_buf[j], self.attention_mask[k],
-            self.cache_write_buf[j][k], i, k, self.value_read_buf[j][k])
+                self.layers[j].forward(self.hidden[i][j][k], self.cache_read_buf[j][k],
+                    self.weight_read_buf[j], self.attention_mask[k],
+                    self.cache_write_buf[j][k], i, k)
+                
+    def compute_preattn(self):
+        raise NotImplementedError
+    
+    def compute_attn(self):
+        raise NotImplementedError
 
     def sync(self):
         self.env.disk.synchronize()
@@ -1157,37 +1000,31 @@ class OptLM:
         for j in range(num_layers):
             for k in range(num_gpu_batches):
                 self.init_cache(j, k)
-                self.init_qkv(j, k)
-                self.init_value(j, k)
         if self.policy.cpu_cache_compute:
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
 
         # Generate
-        if self.policy.cpu_cache_compute:
-            self.generation_loop_cpuattn()
-
-        else:
-            if debug_mode is None:
-                if not overlap:
-                    # No overlap, easy to understand, suitable for debugging
-                    self.generation_loop_normal()
-                else:
-                    # Overlap I/O and compute
-                    if num_gpu_batches == 1:
-                        self.generation_loop_overlap_single_batch()
-                    else:
-                        self.generation_loop_overlap_multi_batch()
-            elif debug_mode == "fewer_batch":
-                # Run fewer layeres and batches for debugging
-                if num_gpu_batches == 1:
-                    self.generation_loop_debug_single_batch()
-                else:
-                    self.generation_loop_debug_multi_batch()
-            elif debug_mode == "breakdown":
-                # No overlap, fewer batches, execution time breakdown
-                self.generation_loop_debug_normal()
+        if debug_mode is None:
+            if not overlap:
+                # No overlap, easy to understand, suitable for debugging
+                self.generation_loop_normal()
             else:
-                raise ValueError("Invalid debug mode: {debug_mode}")
+                # Overlap I/O and compute
+                if num_gpu_batches == 1:
+                    self.generation_loop_overlap_single_batch()
+                else:
+                    self.generation_loop_overlap_multi_batch()
+        elif debug_mode == "fewer_batch":
+            # Run fewer layeres and batches for debugging
+            if num_gpu_batches == 1:
+                self.generation_loop_debug_single_batch()
+            else:
+                self.generation_loop_debug_multi_batch()
+        elif debug_mode == "breakdown":
+            # No overlap, fewer batches, execution time breakdown
+            self.generation_loop_debug_normal()
+        else:
+            raise ValueError("Invalid debug mode: {debug_mode}")
 
         # Delete cache
         for j in range(num_layers):
@@ -1197,58 +1034,6 @@ class OptLM:
             self.env.cpu.del_attention_compute_workspace()
 
         return self.output_ids
-
-    def generation_loop_cpuattn(self):
-        # Prologue
-        for k in range(self.num_gpu_batches):
-            self.load_weight(0, 0, k)
-        self.load_hidden(0, 0, 0)
-        self.sync()
-
-        # Generate
-        for i in range(self.execute_gen_len):
-            timers("generate").start()
-            for k in range(self.num_gpu_batches):
-                self.update_attention_mask(i, k)
-
-            # Loop over the layers in a group of two
-            for j in range(0, self.num_layers):
-                for k in range(self.num_gpu_batches):
-                    # MLP layer & Embed layer
-                    print(i, j, k)
-                    if j % 2 == 0:
-                        self.load_weight(i, j+1, k)
-                        self.load_cache(i, j, k+1)
-                        self.store_hidden(i, j, k-1)
-                        self.load_hidden(i, j, k+1)
-                        self.compute_layer(i, j, k)
-                        self.store_cache(i, j, k-1)
-                        self.sync()
-
-                    # Self-attention layer
-                    else:
-                        self.load_weight(i, j+1, k)
-                        self.load_cache(i, j, k+1) 
-                        self.store_hidden(i, j, k-1)
-                        self.load_hidden(i, j, k+1)
-                        self.compute_layer(i, j, k)
-                        self.store_cache(i, j, k-1)
-
-                        self.compute_layer_preattn(i, j, k+1)
-                        self.store_qkv(i, j, k+1)
-                        self.load_weight_attn(i, j, k+1)
-
-                        self.load_qkv(i, j, k)
-                        self.compute_layer_attn(i, j, k)
-                        self.store_value(i, j, k)
-                        
-                        self.load_value(i, j, k-1)
-                        self.compute_layer_postattn(i, j, k-1)
-
-                        self.sync()
-
-
-            timers("generate").stop()
 
     def generation_loop_normal(self):
         for i in range(self.execute_gen_len):
@@ -1353,7 +1138,7 @@ class OptLM:
                 costs = timers(name).costs
                 print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
 
-        timers.plot(self.num_layers * self.num_gpu_batches, "./plots/opt-6_7b-normal.png")
+        timers.plot(self.num_layers * self.num_gpu_batches, "./plots/opt-6_7b.png")
 
     def generation_loop_overlap_single_batch(self):
         # Prologue
@@ -1372,13 +1157,40 @@ class OptLM:
                 self.compute_layer(i, j, 0)
                 self.store_cache(i, j-1, 0)
                 self.store_hidden(i, j, 0)
-                self.sync()
+                # self.sync()
             timers("generate").stop()
 
             if self.task.stop and np.all(self.stopped):
                 break
 
     def generation_loop_overlap_multi_batch(self):
+        # Prologue
+        for k in range(self.num_gpu_batches):
+            self.load_weight(0, 0, k)
+        self.load_hidden(0, 0, 0)
+        self.sync()
+
+        # Generate
+        for i in range(self.execute_gen_len):
+            timers("generate").start()
+            for k in range(self.num_gpu_batches):
+                self.update_attention_mask(i, k)
+            for j in range(self.num_layers):
+                for k in range(self.num_gpu_batches):
+                    self.load_weight(i, j+1, k)
+                    self.load_cache(i, j, k+1)
+                    self.store_hidden(i, j, k-1)
+                    self.load_hidden(i, j, k+1)
+                    self.compute_layer(i, j, k)
+                    self.store_cache(i, j, k-1)
+                    self.sync()
+            timers("generate").stop()
+
+        # Epilogue
+        self.store_hidden(
+            self.execute_gen_len-1, self.num_layers-1, self.num_gpu_batches-1)
+        
+    def generation_loop_overlap_cpu(self):
         # Prologue
         for k in range(self.num_gpu_batches):
             self.load_weight(0, 0, k)

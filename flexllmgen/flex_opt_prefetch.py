@@ -1035,7 +1035,7 @@ class OptLM:
                 costs = timers(name).costs
                 print(f"{name:22s} (per-batch): {np.mean(costs):.6f} s")
 
-        timers.plot(self.num_layers * self.num_gpu_batches, "./plots/opt-6_7b.png")
+        timers.plot(self.num_layers * self.num_gpu_batches, "./plots/opt-6_7b-prefetch.png")
 
     def generation_loop_overlap_single_batch(self):
         # Prologue
